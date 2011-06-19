@@ -1,0 +1,28 @@
+PPAs
+====
+
+ppa:natecarlson/haproxy (haproxy 1.4 — syntax has changed)
+ppa:iacobs/redis (redis 2.2.2)
+ppa:awstools-dev/awstools (ec2-api-tools 1.4 — filters added)
+
+monit
+=====
+
+monit
+ec2-api-tools
+
+redisX
+======
+
+supervisor
+redis
+
+haproxyX
+========
+
+haproxy
+
+app
+===
+
+haproxy

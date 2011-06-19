@@ -1,0 +1,16 @@
+#!/bin/bash
+
+PORT=$1
+while true; do
+	redis-cli -p $PORT incr salary
+        sleep 0.5
+	redis-cli -p $PORT get salary
+        sleep 0.5
+	redis-cli -p $PORT get salary
+        sleep 0.5
+	redis-cli -p $PORT get salary
+        sleep 0.5
+	redis-cli -p $PORT get salary
+        sleep 0.5
+	redis-cli -p $PORT get salary
+done

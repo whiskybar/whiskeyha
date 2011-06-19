@@ -1,0 +1,225 @@
+#!/bin/bash
+
+#prevent other instances from running (for 5 mins; see man lockfile-create)
+trap "lockfile-remove /var/run/failover; exit 0" EXIT
+lockfile-create /var/run/failover -r 0 2>/dev/null || exit 0
+
+#ec2 stuff
+export EC2_PRIVATE_KEY=/root/.ec2/whiskeymedia.key
+export EC2_CERT=/root/.ec2/whiskeymedia.crt
+AMI_REDIS=ami-3e3ac257
+AMI_HAPROXY=ami-363ac25f
+
+REDIS_PORTS="9001 9002"
+
+#hostnames
+HAPROXY1=haproxy1
+HAPROXY2=haproxy2
+REDIS1=redis1
+REDIS2=redis2
+
+################## AWS utils ################
+
+ip_for_instance() {
+	INSTANCE_ID=$1
+	ec2-describe-instances $INSTANCE_ID --filter instance-state-name=running --hide-tags | 
+		sed -n '2 s/\(\S*\s*\)\{14\}\(\S*\).*/\2/p'
+}
+
+ip_for_name() {
+	NAME=$1.barton
+	ip_for_instance "--filter tag:Name=$NAME"
+}
+
+wait_for_status() {
+	INSTANCE=$1
+	STATUS=$2
+	while [ -z "$(ec2-describe-instances $INSTANCE_ID --filter instance-state-name=$STATUS)" ]; do
+		sleep 5
+	done
+}
+
+#################### AWS tasks #######################
+
+launch_instance() {
+	AMI=$1
+	NAME=$2.barton
+
+	INSTANCE_ID=$(ec2-run-instances $AMI \
+		-g all-whiskey -g ssh \
+		-k barton \
+		-t m1.large \
+		--availability-zone us-east-1a |
+		sed -n 's/.*\<\(i-\S*\).*/\1/p')
+
+	wait_for_status $INSTANCE_ID running
+	ec2-create-tags $INSTANCE_ID --tag Name=$NAME --tag Stage=ha 2>&1 >/dev/null
+	echo $INSTANCE_ID
+}
+
+terminate_ip() {
+	IP=$1
+	INSTANCE_ID="$(ec2-describe-instances --filter private-ip-address=$IP | 
+		sed -n 's/.*\<\(i-\S*\).*/\1/p' | head -1)"
+	[ -z "$INSTANCE_ID" ] && return
+	ec2-terminate-instances $INSTANCE_ID >/dev/null
+	wait_for_status $INSTANCE_ID terminated
+}
+
+##################### Failover primitives ######################
+
+slave_of() {
+#Switch redis servers as slaves of an IP or NO ONE
+	SLAVE_IP=$1
+	MASTER_IP="$2"
+
+	for PORT in $REDIS_PORTS; do
+		if [ "$MASTER_IP" = "NO ONE" ]; then
+			MASTER_PORT=
+		else
+			MASTER_PORT=$PORT
+		fi
+		cat <<END
+			CONFIG_FILE=\$(grep -lr "^port $PORT" /etc/redis)
+			sudo sed -e "/^slaveof/d" -e "$ aslaveof $MASTER_IP $MASTER_PORT " -i \$CONFIG_FILE
+			redis-cli -p $PORT SLAVEOF $MASTER_IP $MASTER_PORT >/dev/null
+END
+	done | ssh $SLAVE_IP
+}
+
+enable_redis() {
+#Add redis servers to a haproxy as backup
+	HAPROXY_IP=$1
+	REDIS_IP=$2
+	ssh $HAPROXY_IP <<END
+		sudo sed '/server haredis1/{p;s/haredis1/haredis2/;s/[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*/$REDIS_IP/;s/\$/ backup/}' -i /etc/haproxy/haproxy.cfg
+		sudo /etc/init.d/haproxy reload
+END
+}
+
+disable_redis() {
+#Remove redis servers from a haproxy
+	HAPROXY_IP=$1
+	REDIS_IP=$2
+	ssh $HAPROXY_IP <<END
+		sudo sed -e '/$REDIS_IP/d' -e '/server haredis/{s/haredis[12]/haredis1/;s/\s*backup//}' -i /etc/haproxy/haproxy.cfg
+		sudo /etc/init.d/haproxy reload
+END
+}
+
+get_master_slave_haproxy() {
+	HAPROXY_IP=$1
+	ssh $HAPROXY_IP <<END
+		sed -n '/server haredis[12]/s/.*\s\([0-9]*\.[0-9]*\.[0-9]*\.[0-9]*\).*/\1/p' /etc/haproxy/haproxy.cfg |
+			head -2 | tr '\n' ' '
+END
+}
+
+reset_haproxy() {
+	HAPROXY_IP=$1
+	REDIS_MASTER_IP=$2
+	REDIS_SLAVE_IP=$3
+	ssh $HAPROXY_IP <<END
+		sudo sed -e '/server haredis1/s/[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*/$REDIS_MASTER_IP/' -e '/server haredis2/s/[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*/$REDIS_SLAVE_IP/' -i /etc/haproxy/haproxy.cfg
+		sudo sed '/^ENABLED/cENABLED=1' -i /etc/default/haproxy
+		sudo /etc/init.d/haproxy restart
+END
+}
+
+monit_ip() {
+	NAME=$1
+	sed -n "/check host $NAME/s/.*\s\([0-9]*\.[0-9]*\.[0-9]*\.[0-9]*\).*/\1/p" /etc/monit/conf.d/*
+}
+
+unmonitor() {
+	NAME=$1
+	monit unmonitor $NAME
+}
+
+monitor() {
+	NAME=$1
+	OLD_IP=$2
+	NEW_IP=$3
+	sed "s/$OLD_IP/$NEW_IP/g" -i /etc/monit/conf.d/*
+	/etc/init.d/monit restart #reloading is not enough for the below
+	monit monitor $NAME
+}
+
+
+#################### Failover actions #######################
+
+failed_redis() {
+	FAILED_NAME=$1
+        GOOD_NAME=$2
+	FAILED_IP=$(monit_ip $FAILED_NAME)
+	GOOD_IP=$(monit_ip $GOOD_NAME)
+
+	echo Unmonitoring the failed redis
+	unmonitor $FAILED_NAME #do this ASAP
+
+	echo Disabling the failed redis in HAProxy
+	HAPROXY1_IP=$(ip_for_name $HAPROXY1)
+	disable_redis $HAPROXY1_IP $FAILED_IP
+	HAPROXY2_IP=$(ip_for_name $HAPROXY2)
+	disable_redis $HAPROXY2_IP $FAILED_IP
+
+	echo Severing the redis replication
+	slave_of $GOOD_IP "NO ONE"
+
+	echo Terminating the failed redis instance
+	terminate_ip $FAILED_IP
+
+	echo Creating a new redis instance
+	NEW_INSTANCE_ID=$(launch_instance $AMI_REDIS $FAILED_NAME)
+	NEW_IP=$(ip_for_name $FAILED_NAME)
+
+	echo Connecting the new redis instance to the replication
+	slave_of $NEW_IP $GOOD_IP
+
+	echo Enabling the new redis in HAProxy
+	enable_redis $HAPROXY1_IP $NEW_IP
+	enable_redis $HAPROXY2_IP $NEW_IP
+
+	echo Monitoring the new redis
+	monitor $FAILED_NAME $FAILED_IP $NEW_IP
+}
+
+failed_haproxy() {
+	FAILED_NAME=$1
+        GOOD_NAME=$2
+	FAILED_IP=$(monit_ip $FAILED_NAME)
+	GOOD_IP=$(monit_ip $GOOD_NAME)
+
+	echo Unmonitoring the failed haproxy
+	unmonitor $FAILED_NAME #do this ASAP
+
+	echo Terminating the failed haproxy instance
+	terminate_ip $FAILED_IP
+
+	echo Creating a new haproxy instance
+	NEW_INSTANCE_ID=$(launch_instance $AMI_HAPROXY $FAILED_NAME)
+	NEW_IP=$(ip_for_name $FAILED_NAME)
+
+	echo Configuring the new haproxy
+	REDIS_IPS="$(get_master_slave_haproxy $GOOD_IP)"
+	reset_haproxy $NEW_IP $REDIS_IPS
+
+	echo TODO: register the new haproxy as $FAILED_NAME in DNS
+	
+	echo Monitoring the new haproxy
+	monitor $FAILED_NAME $FAILED_IP $NEW_IP
+}
+
+
+########################### Main ###################################
+
+SERVICE=$1
+FAILED_NAME=$2
+GOOD_NAME=$3
+
+case $SERVICE in
+redis)		failed_redis $FAILED_NAME $GOOD_NAME;;
+haproxy)	failed_haproxy $FAILED_NAME $GOOD_NAME;;
+*)		echo >&2 "Unknown service $SERVICE";;
+esac
+

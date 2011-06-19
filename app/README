@@ -1,0 +1,2 @@
+redis-test --> /usr/local/bin
+haproxy.cfg --> /etc/haproxy

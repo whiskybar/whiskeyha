@@ -1,0 +1,4 @@
+failover --> /usr/local/sbin
+haproxy --> /etc/monit/conf.d
+redis --> /etc/monit/conf.d
+monitrc --> /etc/monit

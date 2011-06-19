@@ -1,0 +1,29 @@
+check host haproxy1 with address 10.99.13.242
+	if failed icmp type echo
+		for 3 cycles
+		then exec "/usr/local/sbin/failover haproxy haproxy1 haproxy2"
+	if failed port 8001 
+		send "PING\0x0D\0x0A"
+		expect "PONG"
+		for 3 cycles
+		then exec "/usr/local/sbin/failover haproxy haproxy1 haproxy2"
+	if failed port 8002
+		send "PING\0x0D\0x0A"
+		expect "PONG"
+		for 3 cycles
+		then exec "/usr/local/sbin/failover haproxy haproxy1 haproxy2"
+
+check host haproxy2 with address 10.202.31.28
+	if failed icmp type echo
+		for 3 cycles
+		then exec "/usr/local/sbin/failover haproxy haproxy2 haproxy1"
+	if failed port 8001 
+		send "PING\0x0D\0x0A"
+		expect "PONG"
+		for 3 cycles
+		then exec "/usr/local/sbin/failover haproxy haproxy2 haproxy1"
+	if failed port 8002
+		send "PING\0x0D\0x0A"
+		expect "PONG"
+		for 3 cycles
+		then exec "/usr/local/sbin/failover haproxy haproxy2 haproxy1"
